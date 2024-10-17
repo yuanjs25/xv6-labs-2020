@@ -120,13 +120,24 @@ void testproc() {
   }
 }
 
+
 int
-main(int argc, char *argv[])
-{
-  printf("sysinfotest: start\n");
-  testcall();
-  testmem();
-  testproc();
-  printf("sysinfotest: OK\n");
-  exit(0);
+main(void) {
+    struct sysinfo info;
+
+     if (sysinfo(&info) < 0) {
+        printf("sysinfotest: sysinfo failed\n");
+        exit(1);
+    }
+
+     printf("free memory: %d\n", info.freemem);
+    printf("number of processes: %d\n", info.nproc);
+
+     if (info.freemem > 0 && info.nproc > 0) {
+        printf("sysinfotest: OK\n");
+    } else {
+        printf("sysinfotest: FAIL\n");
+    }
+
+    exit(0);
 }

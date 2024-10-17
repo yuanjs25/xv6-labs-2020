@@ -16,7 +16,7 @@ extern char end[]; // first address after kernel.
 
 struct run {
   struct run *next;
-};
+}*freelist;
 
 struct {
   struct spinlock lock;
@@ -79,4 +79,20 @@ kalloc(void)
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+uint64
+freemem(void) {
+    struct run *r;
+    uint64 free_mem = 0;
+
+    acquire(&kmem.lock);
+    r = kmem.freelist;
+    while (r) {
+        free_mem += PGSIZE;
+        r = r->next;
+    }
+    release(&kmem.lock);
+
+    return free_mem;
 }
