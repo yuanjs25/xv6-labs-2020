@@ -41,16 +41,29 @@ sys_wait(void)
 uint64
 sys_sbrk(void)
 {
-  int addr;
-  int n;
+    int addr;
+    int n;
+    struct proc *p = myproc();
 
-  if(argint(0, &n) < 0)
-    return -1;
-  addr = myproc()->sz;
-  if(growproc(n) < 0)
-    return -1;
-  return addr;
+    if(argint(0, &n) < 0)
+        return -1;
+    addr = p->sz;
+
+    // 如果 n 为正，则扩展地址空间
+    if (n > 0) {
+        p->sz += n;
+    } 
+    // 如果 n 为负，则缩小地址空间
+    else if (n < 0) {
+        if (p->sz + n < 0)  // 防止 sz 成为负数
+            return -1;
+        // 回收被缩小的内存
+       p->sz = uvmdealloc(p->pagetable, p->sz, p->sz + n);
+    }
+
+    return addr;
 }
+
 
 uint64
 sys_sleep(void)

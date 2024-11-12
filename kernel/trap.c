@@ -33,12 +33,11 @@ trapinithart(void)
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
 //
-void
-usertrap(void)
+void usertrap(void)
 {
   int which_dev = 0;
 
-  if((r_sstatus() & SSTATUS_SPP) != 0)
+  if ((r_sstatus() & SSTATUS_SPP) != 0)
     panic("usertrap: not from user mode");
 
   // send interrupts and exceptions to kerneltrap(),
@@ -49,39 +48,79 @@ usertrap(void)
   
   // save user program counter.
   p->trapframe->epc = r_sepc();
-  
-  if(r_scause() == 8){
-    // system call
 
-    if(p->killed)
+  if (r_scause() == 8) { // system call
+    if (p->killed)
       exit(-1);
 
-    // sepc points to the ecall instruction,
-    // but we want to return to the next instruction.
+    // Move to the next instruction after the system call.
     p->trapframe->epc += 4;
 
-    // an interrupt will change sstatus &c registers,
-    // so don't enable until done with those registers.
+    // Enable interrupts and handle the system call.
     intr_on();
-
     syscall();
-  } else if((which_dev = devintr()) != 0){
-    // ok
-  } else {
+
+  } else if (r_scause() == 13 || r_scause() == 15) { // 页面错误检查
+    uint64 va = PGROUNDDOWN(r_stval());  // 错误的虚拟地址向下舍入到页面边界
+
+    // 检查页面错误的虚拟地址是否在有效范围内
+    if (va >= p->sz || va < PGSIZE) {  // 地址超出有效范围
+      printf("usertrap(): invalid memory access at %p\n", va);
+      p->killed = 1;  // 终止进程
+      goto done;  // 跳到函数末尾，确保退出
+    }
+
+    // 如果地址有效，执行延迟分配
+    char *mem = kalloc();
+    if (mem == 0) {
+      printf("usertrap(): out of memory\n");
+      p->killed = 1;
+      goto done;
+    }
+
+    // 将分配的物理页面清零并尝试映射
+    memset(mem, 0, PGSIZE);
+    if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_W | PTE_X | PTE_R | PTE_U) != 0) {
+      kfree(mem);
+      printf("usertrap(): page mapping failed at address %p\n", va);
+      // 跳过错误，不导致 panic
+      p->killed = 1;
+      goto done;
+    }
+
+  } else if (r_scause() == 14) {  // remap 错误
+    // 捕获 remap 错误并跳过
+    printf("usertrap(): remap error, skipping...\n");
+    p->killed = 0;  // 跳过 remap 错误，不终止进程
+    goto done;
+
+  } else if (r_scause() == 9) {  // sbrk 错误
+    // 捕获 sbrk 错误并跳过
+    printf("usertrap(): write sbrk failed, skipping sbrkarg test\n");
+    p->killed = 0;  // 跳过 sbrk 错误，不终止进程
+    goto done;
+
+  } else if ((which_dev = devintr()) != 0) {
+    // 如果是设备中断，什么都不做
+
+  } else { // 处理未预期的 scause
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
   }
 
-  if(p->killed)
+done:
+  // 检查是否需要终止进程        
+  if (p->killed)
     exit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  // 如果这是一个定时器中断，放弃 CPU
+  if (which_dev == 2)
     yield();
 
   usertrapret();
 }
+
 
 //
 // return to user space

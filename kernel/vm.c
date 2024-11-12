@@ -181,9 +181,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+    if(pte == 0)
+      continue;  // 跳过未映射的页面，避免 panic
+
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -258,16 +260,22 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 uint64
 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 {
-  if(newsz >= oldsz)
-    return oldsz;
+    if(newsz >= oldsz)
+        return oldsz;
 
-  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
-    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
-    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
-  }
+    uint64 a;
+    for(a = PGROUNDUP(newsz); a < oldsz; a += PGSIZE){
+        pte_t *pte = walk(pagetable, a, 0);
+        if(pte && (*pte & PTE_V)){  // 仅当页面有效时才解除映射
+            uint64 pa = PTE2PA(*pte);
+            kfree((void*)pa);
+            *pte = 0;
+        }
+    }
 
-  return newsz;
+    return newsz;
 }
+
 
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
@@ -312,12 +320,11 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   uint64 pa, i;
   uint flags;
   char *mem;
-
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -325,12 +332,13 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     memmove(mem, (char*)pa, PGSIZE);
     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
       kfree(mem);
-      goto err;
+       printf("uvmcopy: remap failed at address %p\n", i);  // 打印出错信息
+      return -1;  // 跳过当前错误，继续
     }
   }
   return 0;
 
- err:
+err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
