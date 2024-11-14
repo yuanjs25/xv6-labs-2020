@@ -30,16 +30,16 @@ procinit(void)
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
-
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+// lab3-2
+//      // Allocate a page for the process's kernel stack.
+//      // Map it high in memory, followed by an invalid
+//      // guard page.
+//      char *pa = kalloc();
+//      if(pa == 0)
+//        panic("kalloc");
+//      uint64 va = KSTACK((int) (p - proc));
+//      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+//      p->kstack = va;
   }
   kvminithart();
 }
@@ -89,6 +89,10 @@ allocpid() {
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
+// Look in the process table for an UNUSED proc.
+// If found, initialize state required to run in the kernel,
+// and return with p->lock held.
+// If there are no free procs, or a memory allocation fails, return 0.
 static struct proc*
 allocproc(void)
 {
@@ -121,14 +125,39 @@ found:
     return 0;
   }
 
+  p->kpagetable = proc_kpagetable(p);
+  if (p->kpagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  char *pa = kalloc();    // 分配页面
+  if(pa == 0) {
+    panic("kalloc");
+  }
+  uint64 va = KSTACK(0);
+  uvmmap(p->kpagetable,va, (uint64)pa,PGSIZE,PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
   return p;
 }
+
+// Free kernel page table without freeing physical memory - lab3-2
+void proc_freekpagetable(pagetable_t kpagetable) {
+    uvmunmap(kpagetable, UART0, 1, 0);
+    uvmunmap(kpagetable, VIRTIO0, 1, 0);
+//    uvmunmap(kpagetable, CLINT, 0x10000 / PGSIZE, 0);
+    uvmunmap(kpagetable, PLIC, 0x400000 / PGSIZE, 0);
+    uvmunmap(kpagetable, KERNBASE, (PHYSTOP - KERNBASE) / PGSIZE, 0);
+    uvmunmap(kpagetable, TRAMPOLINE, 1, 0);
+    uvmfree(kpagetable, 0);
+}
+
 
 // free a proc structure and the data hanging from it,
 // including user pages.
@@ -149,6 +178,14 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  if(p->kstack) {
+    uvmunmap(p->kpagetable, p->kstack, 1, 1);
+  }
+  p->kstack = 0;
+  if(p->kpagetable){
+    proc_freekpagetable(p->kpagetable);
+  }
+  p->kpagetable=0;
   p->state = UNUSED;
 }
 
@@ -221,6 +258,8 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  u2kvmcopy(p->pagetable, p->kpagetable, 0, p->sz);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -235,6 +274,9 @@ userinit(void)
 
 // Grow or shrink user memory by n bytes.
 // Return 0 on success, -1 on failure.
+
+// Grow or shrink user memory by n bytes.
+// Return 0 on success, -1 on failure.
 int
 growproc(int n)
 {
@@ -243,15 +285,26 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    if(sz + n > PLIC){
+      return -1;
+    }
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+      return -1;
+    }
+    if(u2kvmcopy(p->pagetable, p->kpagetable, p->sz, sz) < 0){
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    if (PGROUNDUP(sz) < PGROUNDUP(p->sz)) {
+      uvmunmap(p->kpagetable, PGROUNDUP(sz),
+               (PGROUNDUP(p->sz) - PGROUNDUP(sz)) / PGSIZE, 0);
+    }
   }
   p->sz = sz;
   return 0;
 }
+
 
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
@@ -274,6 +327,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  if(u2kvmcopy(np->pagetable, np->kpagetable, 0, np->sz) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   np->parent = p;
 
@@ -453,6 +512,13 @@ wait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+// Per-CPU process scheduler.
+// Each CPU calls scheduler() after setting itself up.
+// Scheduler never returns.  It loops, doing:
+//  - choose a process to run.
+//  - swtch to start running that process.
+//  - eventually that process transfers control
+//    via swtch back to the scheduler.
 void
 scheduler(void)
 {
@@ -461,27 +527,26 @@ scheduler(void)
   
   c->proc = 0;
   for(;;){
-    // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
     
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
         c->proc = 0;
 
         found = 1;
       }
       release(&p->lock);
+    }
+    if(found == 0) {
+        kvminithart();
     }
 #if !defined (LAB_FS)
     if(found == 0) {
@@ -493,6 +558,7 @@ scheduler(void)
 #endif
   }
 }
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores

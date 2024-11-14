@@ -125,20 +125,19 @@ kvmmap(uint64 va, uint64 pa, uint64 sz, int perm)
 // a physical address. only needed for
 // addresses on the stack.
 // assumes va is page aligned.
-uint64
-kvmpa(uint64 va)
-{
-  uint64 off = va % PGSIZE;
-  pte_t *pte;
-  uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
-  if(pte == 0)
-    panic("kvmpa");
-  if((*pte & PTE_V) == 0)
-    panic("kvmpa");
-  pa = PTE2PA(*pte);
-  return pa+off;
+
+uint64 kvmpa(pagetable_t kernel_pagetable, uint64 va) {
+    uint64 off = va % PGSIZE;
+    pte_t *pte;
+    uint64 pa;
+
+    pte = walk(kernel_pagetable, va, 0);
+    if (pte == 0)
+        panic("kvmpa");
+    if ((*pte & PTE_V) == 0)
+        panic("kvmpa");
+    pa = PTE2PA(*pte);
+    return pa + off;
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -335,6 +334,30 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   return -1;
 }
 
+int u2kvmcopy(pagetable_t upagetable, pagetable_t kpagetable, uint64 begin, uint64 end) {
+    pte_t *pte;
+    uint64 pa, i;
+    uint flags;
+    uint64 begin_page = PGROUNDUP(begin);
+    for(i = begin_page; i < end; i += PGSIZE){
+        if((pte = walk(upagetable, i, 0)) == 0)
+            panic("uvmcopy2kvm: pte should exist");
+        if((*pte & PTE_V) == 0)
+            panic("uvmcopy2kvm: page not present");
+        pa = PTE2PA(*pte);
+        flags = PTE_FLAGS(*pte) & (~PTE_U);
+        if(mappages(kpagetable, i, PGSIZE, pa, flags) != 0){
+            goto err;
+        }
+    }
+    return 0;
+
+err:
+    uvmunmap(kpagetable, begin_page, (i- begin_page) / PGSIZE, 0);
+    return -1;
+}
+
+
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -379,64 +402,64 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+    return copyin_new(pagetable, dst, srcva, len);
 }
 
-// Copy a null-terminated string from user to kernel.
-// Copy bytes to dst from virtual address srcva in a given page table,
-// until a '\0', or max.
-// Return 0 on success, -1 on error.
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+    return copyinstr_new(pagetable, dst, srcva, max);
+}
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
 
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
+void vmprint(pagetable_t pagetable) {
+    printf("page table %p\n", pagetable);
+    const int PAGE_SIZE = 512;
+    for (int i = 0; i < PAGE_SIZE; ++i) {
+        pte_t top_pte = pagetable[i];
+        if (top_pte & PTE_V) {
+            printf("..%d: pte %p pa %p\n", i, top_pte, PTE2PA(top_pte));
+            pagetable_t mid_table = (pagetable_t) PTE2PA(top_pte);
+            for (int j = 0; j < PAGE_SIZE; ++j) {
+                pte_t mid_pte = mid_table[j];
+                if (mid_pte & PTE_V) {
+                    printf(".. ..%d: pte %p pa %p\n",
+                           j, mid_pte, PTE2PA(mid_pte));
+                    pagetable_t bot_table = (pagetable_t) PTE2PA(mid_pte);
+                    for (int k = 0; k < PAGE_SIZE; ++k) {
+                        pte_t bot_pte = bot_table[k];
+                        if (bot_pte & PTE_V) {
+                            printf(".. .. ..%d: pte %p pa %p\n",
+                                   k, bot_pte, PTE2PA(bot_pte));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+void uvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm) {
+    if(mappages(pagetable, va, sz, pa, perm) != 0) {
+        panic("uvmmap");
+    }
+}
+
+
+pagetable_t proc_kpagetable(struct proc *p) {
+    pagetable_t kpagetable = uvmcreate();
+    if(kpagetable == 0){
+        return 0;
     }
 
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+    uvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+    uvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+    // uvmmap(kpagetable, CLINT, CLINT, 0x10000, PTE_R | PTE_W); // 注释掉 CLINT 部分
+    uvmmap(kpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+    uvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+    uvmmap(kpagetable, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+    uvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+    return kpagetable;
 }
